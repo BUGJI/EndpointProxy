@@ -1,0 +1,9 @@
+{
+    "clients": {
+        "home-instance": {
+            "secret": "your-secret-key-change-this",
+            "permissions": ["*"],
+            "description": "The Home instance"
+        }
+    }
+}
