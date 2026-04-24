@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 import backoff  # 需要安装：pip install backoff
 from pathlib import Path
+import configparser
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ class ConnectionConfig:
     
     def is_valid(self) -> bool:
         """检查配置是否有效"""
-        return bool(self.node_id and self.auth_token and self.enabled)
+        return bool(self.node_id and self.enabled)
     
     def create_client(self) -> ReverseProxyClient:
         """根据配置创建客户端实例"""
@@ -86,29 +87,62 @@ class ConnectionConfig:
 
 
 class MultiConnectionManager:
-    """多连接管理器"""
+    """多连接管理器 - 支持 INI 格式配置文件"""
     def __init__(self, config_file: str):
         self.config_file = Path(config_file)
         self.connections: List[ConnectionConfig] = []
-        self.clients: List[ReverseProxyClient] = []
+        self.global_auth_token = ''
+        self.global_server_ws = ''
         self.load_config()
     
     def load_config(self):
-        """加载配置文件"""
+        """加载 INI 配置文件"""
         if not self.config_file.exists():
             logger.error(f"Config file not found: {self.config_file}")
             return
         
         try:
-            with open(self.config_file, 'r') as f:
-                config = json.load(f)
+            config = configparser.ConfigParser()
+            config.read(self.config_file, encoding='utf-8')
             
-            connections_list = config.get('connections', [])
-            for conn_config in connections_list:
+            # 读取全局配置（可选）
+            if 'global' in config:
+                self.global_auth_token = config.get('global', 'auth_token', fallback='')
+                self.global_server_ws = config.get('global', 'server_ws', fallback='ws://127.0.0.1:11435/ws')
+                logger.info(f"Loaded global config: server_ws={self.global_server_ws}")
+            
+            # 读取所有连接配置
+            for section in config.sections():
+                if section == 'global':
+                    continue
+                
+                # 跳过非 connection 节（可选：只处理以 connection_ 开头的节）
+                if not section.startswith('connection'):
+                    logger.warning(f"Skipping non-connection section: {section}")
+                    continue
+                
+                # 获取节点 ID（必须）
+                node_id = config.get(section, 'node_id', fallback='')
+                if not node_id:
+                    logger.warning(f"Skipping section {section}: missing node_id")
+                    continue
+                
+                # 构建配置字典
+                conn_config = {
+                    'node_id': node_id,
+                    'auth_token': config.get(section, 'auth_token', fallback=self.global_auth_token),
+                    'server_ws': config.get(section, 'server_ws', fallback=self.global_server_ws),
+                    'local_server': config.get(section, 'local_server', fallback='http://127.0.0.1:11434'),
+                    'heartbeat_interval': config.getint(section, 'heartbeat_interval', fallback=15),
+                    'reconnect_delay': config.getint(section, 'reconnect_delay', fallback=5),
+                    'enabled': config.getboolean(section, 'enabled', fallback=True),
+                    'description': config.get(section, 'description', fallback=f'Connection: {section}')
+                }
+                
                 conn = ConnectionConfig(conn_config)
                 if conn.is_valid():
                     self.connections.append(conn)
-                    logger.info(f"Loaded connection: {conn.node_id} ({conn.description or 'no description'})")
+                    logger.info(f"Loaded connection: {conn.node_id} ({conn.description})")
                 else:
                     logger.warning(f"Skipping invalid connection config: {conn_config}")
             

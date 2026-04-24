@@ -12,6 +12,7 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web, ClientSession
 import uuid
+import configparser
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,21 +21,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class AuthManager:
-    """简单的JSON认证管理器"""
+    """支持 INI 和 JSON 格式的认证管理器"""
     
-    def __init__(self, config_file: str = "auth_config.json"):
+    def __init__(self, config_file: str = "auth_config.ini"):
         self.config_file = config_file
         self.clients: Dict[str, dict] = {}
+        self.global_auth_token = ''
+        # Web 面板管理员账号密码
+        self.admin_username = ''
+        self.admin_password = ''
         self.load_config()
     
     def load_config(self):
-        """加载认证配置"""
-        if Path(self.config_file).exists():
-            with open(self.config_file, 'r') as f:
-                config = json.load(f)
-                self.clients = config.get('clients', {})
-            logger.info(f"Loaded {len(self.clients)} clients from {self.config_file}")
-        else:
+        """加载认证配置（支持 INI 和 JSON 格式）"""
+        config_path = Path(self.config_file)
+        if not config_path.exists():
             # 创建默认配置
             default_config = {
                 "clients": {
@@ -49,11 +50,130 @@ class AuthManager:
             self.clients = default_config['clients']
             logger.warning(f"Created default config file: {self.config_file}")
             logger.warning(f"PLEASE CHANGE THE SECRET KEY!")
+            return
+        
+        # 检测文件格式
+        suffix = config_path.suffix.lower()
+        
+        if suffix == '.ini':
+            self._load_ini_config(config_path)
+        elif suffix == '.json':
+            self._load_json_config(config_path)
+        else:
+            # 尝试自动检测
+            try:
+                with open(config_path, 'r') as f:
+                    content = f.read().strip()
+                if content.startswith('['):
+                    self._load_ini_config(config_path)
+                elif content.startswith('{'):
+                    self._load_json_config(config_path, content)
+                else:
+                    logger.error(f"Unknown config format: {self.config_file}")
+            except Exception as e:
+                logger.error(f"Failed to detect config format: {e}")
+    
+    def _load_ini_config(self, config_path: Path):
+        """加载 INI 格式配置"""
+        try:
+            config = configparser.ConfigParser()
+            config.read(config_path, encoding='utf-8')
+            
+            # 读取全局配置（可选）
+            if 'global' in config:
+                self.global_auth_token = config.get('global', 'auth_token', fallback='')
+                self.admin_username = config.get('global', 'admin_username', fallback='')
+                self.admin_password = config.get('global', 'admin_password', fallback='')
+                logger.info(f"Loaded global auth_token from INI config")
+                if self.admin_username:
+                    logger.info(f"Web panel admin username configured: {self.admin_username}")
+            
+            # 读取所有客户端配置
+            for section in config.sections():
+                if section == 'global':
+                    continue
+                
+                # 跳过非 client 节
+                if not section.startswith('client'):
+                    continue
+                
+                node_id = config.get(section, 'node_id', fallback='')
+                if not node_id:
+                    logger.warning(f"Skipping section {section}: missing node_id")
+                    continue
+                
+                secret = config.get(section, 'auth_token', fallback=self.global_auth_token)
+                permissions_str = config.get(section, 'permissions', fallback='*')
+                permissions = [p.strip() for p in permissions_str.split(',')]
+                description = config.get(section, 'description', fallback=f'Client: {section}')
+                
+                self.clients[node_id] = {
+                    'secret': secret,
+                    'permissions': permissions,
+                    'description': description
+                }
+                logger.info(f"Loaded client: {node_id} ({description})")
+            
+            logger.info(f"Loaded {len(self.clients)} clients from INI config")
+        except Exception as e:
+            logger.error(f"Failed to load INI config: {e}")
+    
+    def _load_json_config(self, config_path: Path, content: str = None):
+        """加载 JSON 格式配置"""
+        try:
+            if content is None:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+            else:
+                config = json.loads(content)
+            
+            self.clients = config.get('clients', {})
+            # JSON 格式也支持 admin 配置
+            admin_config = config.get('admin', {})
+            self.admin_username = admin_config.get('username', '')
+            self.admin_password = admin_config.get('password', '')
+            logger.info(f"Loaded {len(self.clients)} clients from JSON config")
+            if self.admin_username:
+                logger.info(f"Web panel admin username configured: {self.admin_username}")
+        except Exception as e:
+            logger.error(f"Failed to load JSON config: {e}")
     
     def save_config(self, config: dict):
-        """保存配置"""
-        with open(self.config_file, 'w') as f:
-            json.dump(config, f, indent=2)
+        """保存配置（根据文件扩展名选择格式）"""
+        config_path = Path(self.config_file)
+        suffix = config_path.suffix.lower()
+        
+        if suffix == '.ini':
+            ini_config = configparser.ConfigParser()
+            # 写入全局配置
+            if self.admin_username or self.global_auth_token:
+                ini_config['global'] = {}
+                if self.global_auth_token:
+                    ini_config['global']['auth_token'] = self.global_auth_token
+                if self.admin_username:
+                    ini_config['global']['admin_username'] = self.admin_username
+                if self.admin_password:
+                    ini_config['global']['admin_password'] = self.admin_password
+            if 'clients' in config:
+                for node_id, data in config['clients'].items():
+                    section_name = f"client_{node_id.replace('-', '_')}"
+                    ini_config[section_name] = {
+                        'node_id': node_id,
+                        'auth_token': data.get('secret', ''),
+                        'permissions': ', '.join(data.get('permissions', ['*'])),
+                        'description': data.get('description', '')
+                    }
+            with open(config_path, 'w') as f:
+                ini_config.write(f)
+        else:
+            output_config = {'clients': config.get('clients', {})}
+            if self.admin_username or self.admin_password:
+                output_config['admin'] = {
+                    'username': self.admin_username,
+                    'password': self.admin_password
+                }
+            with open(config_path, 'w') as f:
+                json.dump(output_config, f, indent=2)
     
     def authenticate(self, node_id: str, auth_token: str) -> bool:
         """验证客户端"""
@@ -275,7 +395,7 @@ class ReverseProxyServer:
                 "timestamp": datetime.now().isoformat()
             })
         
-        if request.path == '/nodes':
+        if request.path == '/nodes' or request.path == '/node/list':
             nodes = []
             for node_id, data in self.clients.items():
                 nodes.append({
@@ -287,6 +407,16 @@ class ReverseProxyServer:
                 })
             return web.json_response({"nodes": nodes, "total": len(nodes)})
         
+        # Web 面板管理接口
+        if request.path == '/api/panel/login':
+            return await self.handle_panel_login(request)
+        if request.path == '/api/panel/nodes':
+            return await self.handle_panel_nodes(request)
+        if request.path == '/api/panel/keys':
+            return await self.handle_panel_keys(request)
+        if request.path.startswith('/api/panel/key/'):
+            return await self.handle_panel_key_operation(request)
+
         # 解析路径: /{node_id}/{path}
         path_parts = request.path.lstrip('/').split('/', 1)
         
@@ -305,6 +435,173 @@ class ReverseProxyServer:
         # 代理请求
         return await self.proxy_request(node_id, request, remaining_path)
     
+    async def check_admin_auth(self, request: web.Request) -> bool:
+        """检查管理员认证"""
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return False
+        
+        token = auth_header[7:]
+        import base64
+        try:
+            decoded = base64.b64decode(token).decode('utf-8')
+            username, password = decoded.split(':', 1)
+            return username == self.auth.admin_username and password == self.auth.admin_password
+        except:
+            return False
+    
+    async def handle_panel_login(self, request: web.Request):
+        """处理面板登录"""
+        if request.method != 'POST':
+            return web.json_response({"error": "Method not allowed"}, status=405)
+        
+        try:
+            data = await request.json()
+            username = data.get('username', '')
+            password = data.get('password', '')
+            
+            if not self.auth.admin_username or not self.auth.admin_password:
+                return web.json_response({"error": "Admin credentials not configured"}, status=503)
+            
+            if username == self.auth.admin_username and password == self.auth.admin_password:
+                import base64
+                token = base64.b64encode(f"{username}:{password}".encode()).decode()
+                return web.json_response({
+                    "success": True,
+                    "token": token,
+                    "username": username
+                })
+            else:
+                return web.json_response({"error": "Invalid credentials"}, status=401)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+    
+    async def handle_panel_nodes(self, request: web.Request):
+        """处理面板节点列表请求"""
+        if not await self.check_admin_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        
+        if request.method != 'GET':
+            return web.json_response({"error": "Method not allowed"}, status=405)
+        
+        nodes = []
+        for node_id, data in self.clients.items():
+            nodes.append({
+                "node_id": node_id,
+                "info": data.get("info", {}),
+                "connected_at": data.get("connected_at").isoformat() if data.get("connected_at") else None,
+                "last_seen": data.get("last_seen").isoformat() if data.get("last_seen") else None,
+                "description": self.auth.clients.get(node_id, {}).get('description', ''),
+                "permissions": self.auth.clients.get(node_id, {}).get('permissions', [])
+            })
+        return web.json_response({"nodes": nodes, "total": len(nodes)})
+    
+    async def handle_panel_keys(self, request: web.Request):
+        """处理面板密钥管理请求（列出所有密钥）"""
+        if not await self.check_admin_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        
+        if request.method != 'GET':
+            return web.json_response({"error": "Method not allowed"}, status=405)
+        
+        keys = []
+        for node_id, data in self.auth.clients.items():
+            keys.append({
+                "node_id": node_id,
+                "secret": data.get('secret', ''),
+                "permissions": data.get('permissions', []),
+                "description": data.get('description', '')
+            })
+        return web.json_response({"keys": keys, "total": len(keys)})
+    
+    async def handle_panel_key_operation(self, request: web.Request):
+        """处理面板密钥增删改操作"""
+        if not await self.check_admin_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        
+        path_parts = request.path.rstrip('/').split('/')
+        if len(path_parts) < 5:
+            return web.json_response({"error": "Invalid path"}, status=400)
+        
+        node_id = path_parts[-1]
+        
+        if request.method == 'PUT':
+            try:
+                data = await request.json()
+                secret = data.get('secret', '')
+                permissions = data.get('permissions', ['*'])
+                description = data.get('description', f'Client: {node_id}')
+                
+                if not secret:
+                    import secrets
+                    secret = secrets.token_urlsafe(32)
+                
+                self.auth.clients[node_id] = {
+                    'secret': secret,
+                    'permissions': permissions if isinstance(permissions, list) else [permissions],
+                    'description': description
+                }
+                
+                self.auth.save_config({'clients': self.auth.clients})
+                logger.info(f"Updated/Added key for node: {node_id}")
+                return web.json_response({
+                    "success": True,
+                    "node_id": node_id,
+                    "secret": secret,
+                    "message": "Key updated successfully"
+                })
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=400)
+        
+        elif request.method == 'DELETE':
+            if node_id not in self.auth.clients:
+                return web.json_response({"error": "Node not found"}, status=404)
+            
+            del self.auth.clients[node_id]
+            
+            if node_id in self.clients:
+                ws = self.clients[node_id].get("websocket")
+                if ws and not ws.closed:
+                    await ws.close()
+                del self.clients[node_id]
+            
+            self.auth.save_config({'clients': self.auth.clients})
+            logger.info(f"Deleted key for node: {node_id}")
+            return web.json_response({
+                "success": True,
+                "node_id": node_id,
+                "message": "Key deleted successfully"
+            })
+        
+        elif request.method == 'POST':
+            try:
+                data = await request.json()
+                if node_id not in self.auth.clients:
+                    return web.json_response({"error": "Node not found"}, status=404)
+                
+                current = self.auth.clients[node_id]
+                if 'secret' in data:
+                    current['secret'] = data['secret']
+                if 'permissions' in data:
+                    perms = data['permissions']
+                    current['permissions'] = perms if isinstance(perms, list) else [perms]
+                if 'description' in data:
+                    current['description'] = data['description']
+                
+                self.auth.clients[node_id] = current
+                self.auth.save_config({'clients': self.auth.clients})
+                logger.info(f"Modified key for node: {node_id}")
+                return web.json_response({
+                    "success": True,
+                    "node_id": node_id,
+                    "message": "Key modified successfully"
+                })
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=400)
+        
+        else:
+            return web.json_response({"error": "Method not allowed"}, status=405)
+
     async def start_api_service(self):
         """启动API服务"""
         app = web.Application()
