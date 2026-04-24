@@ -83,6 +83,8 @@ python server.py --api-host 0.0.0.0 --api-port 11434 \
 
 ### 3. 启动客户端
 
+#### 单连接模式（原有方式）
+
 在内网机器上运行：
 
 ```bash
@@ -99,6 +101,55 @@ python client.py --node-id home-instance \
 - `--local-server`: 本地服务地址（默认：http://127.0.0.1:11434）
 - `--heartbeat`: 心跳间隔（秒，默认：15）
 - `--reconnect-delay`: 重连延迟（秒，默认：5）
+
+#### 多连接模式（配置文件方式）
+
+创建客户端配置文件 `client_config.json`：
+
+```json
+{
+    "connections": [
+        {
+            "node_id": "home-ollama",
+            "auth_token": "your-secret-key-change-this",
+            "server_ws": "ws://your-server-ip:11435/ws",
+            "local_server": "http://127.0.0.1:11434",
+            "heartbeat_interval": 15,
+            "reconnect_delay": 5,
+            "enabled": true,
+            "description": "Home Ollama instance"
+        },
+        {
+            "node_id": "office-api",
+            "auth_token": "another-secret-key",
+            "server_ws": "ws://your-server-ip:11435/ws",
+            "local_server": "http://127.0.0.1:8080",
+            "heartbeat_interval": 20,
+            "reconnect_delay": 10,
+            "enabled": true,
+            "description": "Office API server"
+        }
+    ]
+}
+```
+
+配置项说明：
+- `node_id`: 客户端唯一标识（必需）
+- `auth_token`: 认证令牌（必需）
+- `server_ws`: 服务器 WebSocket 地址（可选，默认：ws://127.0.0.1:11435/ws）
+- `local_server`: 本地服务地址（可选，默认：http://127.0.0.1:11434）
+- `heartbeat_interval`: 心跳间隔秒数（可选，默认：15）
+- `reconnect_delay`: 重连延迟秒数（可选，默认：5）
+- `enabled`: 是否启用此连接（可选，默认：true）
+- `description`: 连接描述信息（可选）
+
+启动多连接客户端：
+
+```bash
+python client.py --config client_config.json
+```
+
+此模式会同时启动配置文件中所有 `enabled: true` 的连接，每个连接独立运行、自动重连。
 
 ### 4. 访问服务
 
@@ -117,6 +168,38 @@ curl -X POST http://your-server-ip:11434/home-instance/v1/chat/completions \
 curl http://your-server-ip:11434/home-instance/v1/chat/completions \
      -d '{"stream": true}'
 ```
+
+## 使用场景示例
+
+### 单客户端场景
+
+将本地的 Ollama 服务暴露到公网：
+
+```bash
+# 客户端（运行在有 Ollama 的机器上）
+python client.py --node-id ollama-home \
+                 --auth-token my-secret \
+                 --server-ws ws://server:11435/ws \
+                 --local-server http://127.0.0.1:11434
+
+# 访问（从任何地方）
+curl http://server:11434/ollama-home/api/generate \
+     -d '{"model": "llama2", "prompt": "Hello"}'
+```
+
+### 多客户端场景
+
+在一台机器上同时代理多个本地服务：
+
+```bash
+# 配置文件 client_config.json 包含多个连接
+python client.py --config client_config.json
+```
+
+适用场景：
+- 同时暴露 Ollama、数据库管理界面、监控面板等多个服务
+- 不同服务使用不同的 node_id 和权限配置
+- 统一管理所有连接的启动和停止
 
 ## 管理接口
 
@@ -162,24 +245,8 @@ curl http://localhost:11434/nodes
 }
 ```
 
-## 使用场景
+## 其他 HTTP 服务
 
-### Ollama 远程访问
-将本地的 Ollama 服务暴露到公网：
-
-```bash
-# 客户端（运行在有 Ollama 的机器上）
-python client.py --node-id ollama-home \
-                 --auth-token my-secret \
-                 --server-ws ws://server:11435/ws \
-                 --local-server http://127.0.0.1:11434
-
-# 访问（从任何地方）
-curl http://server:11434/ollama-home/api/generate \
-     -d '{"model": "llama2", "prompt": "Hello"}'
-```
-
-### 其他 HTTP 服务
 同样适用于任何 HTTP 服务：
 - Web API
 - 数据库管理界面
@@ -192,6 +259,55 @@ curl http://server:11434/ollama-home/api/generate \
 2. **使用 HTTPS/WSS** - 生产环境建议使用反向代理（如 Nginx）启用 TLS
 3. **限制权限** - 为不同客户端配置最小必要权限
 4. **防火墙配置** - 仅开放必要的端口
+5. **配置文件安全** - `client_config.json` 包含敏感信息，请妥善保管并设置合适的文件权限
+
+## 配置文件示例
+
+### 服务器认证配置 (auth_config.json)
+
+```json
+{
+    "clients": {
+        "home-ollama": {
+            "secret": "your-secret-key-change-this",
+            "permissions": ["*"],
+            "description": "Home Ollama instance"
+        },
+        "office-api": {
+            "secret": "another-secret-key",
+            "permissions": ["/api/*"],
+            "description": "Office API server with limited permissions"
+        }
+    }
+}
+```
+
+### 客户端多连接配置 (client_config.json)
+
+```json
+{
+    "connections": [
+        {
+            "node_id": "home-ollama",
+            "auth_token": "your-secret-key-change-this",
+            "server_ws": "ws://your-server-ip:11435/ws",
+            "local_server": "http://127.0.0.1:11434",
+            "heartbeat_interval": 15,
+            "reconnect_delay": 5,
+            "enabled": true,
+            "description": "Home Ollama instance"
+        },
+        {
+            "node_id": "office-api",
+            "auth_token": "another-secret-key",
+            "server_ws": "ws://your-server-ip:11435/ws",
+            "local_server": "http://127.0.0.1:8080",
+            "enabled": true,
+            "description": "Office API server"
+        }
+    ]
+}
+```
 
 ## 日志示例
 
