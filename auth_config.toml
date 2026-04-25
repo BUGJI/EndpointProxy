@@ -1,0 +1,30 @@
+# 服务端认证配置文件 (TOML 格式 - 参考 frp 结构)
+# 全局配置 - 所有客户端共用的默认配置
+[global]
+auth_token = "your-global-auth-token"      # 全局默认的认证 token
+admin_username = "admin"                    # Web 面板管理员用户名
+admin_password = "admin123"                 # Web 面板管理员密码（请修改！）
+panel_path = "/"                            # Web 面板访问路径，例如 "/" 或 "/dashboard"
+
+# 客户端配置 - 字典格式 [clients.node_id]
+[clients.home-ollama]
+secret = "home-secret-key-123"
+permissions = ["*"]
+description = "Home Ollama Server"
+
+[clients.office-ollama]
+secret = "office-secret-key-456"
+permissions = ["*", "/api/generate", "/api/chat"]
+description = "Office Ollama Server"
+
+[clients.backup-ollama]
+secret = "backup-secret-key-789"
+permissions = ["/api/*"]
+description = "Backup Ollama Server"
+
+# 或者使用数组格式 [[clients]]
+# [[clients]]
+# node_id = "another-client"
+# secret = "another-secret"
+# permissions = ["*"]
+# description = "Another Client"
