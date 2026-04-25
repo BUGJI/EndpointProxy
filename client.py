@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 import backoff  # 需要安装：pip install backoff
 from pathlib import Path
+import tomli
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ class ConnectionConfig:
     
     def is_valid(self) -> bool:
         """检查配置是否有效"""
-        return bool(self.node_id and self.auth_token and self.enabled)
+        return bool(self.node_id and self.enabled)
     
     def create_client(self) -> ReverseProxyClient:
         """根据配置创建客户端实例"""
@@ -86,35 +87,96 @@ class ConnectionConfig:
 
 
 class MultiConnectionManager:
-    """多连接管理器"""
+    """多连接管理器 - 支持 TOML 格式配置文件（参考 frp 结构）"""
     def __init__(self, config_file: str):
         self.config_file = Path(config_file)
         self.connections: List[ConnectionConfig] = []
-        self.clients: List[ReverseProxyClient] = []
+        self.global_auth_token = ''
+        self.global_server_ws = ''
         self.load_config()
     
     def load_config(self):
-        """加载配置文件"""
+        """加载 TOML 配置文件"""
         if not self.config_file.exists():
             logger.error(f"Config file not found: {self.config_file}")
             return
         
         try:
-            with open(self.config_file, 'r') as f:
-                config = json.load(f)
+            # 检测文件格式，只支持 TOML
+            suffix = self.config_file.suffix.lower()
+            if suffix != '.toml':
+                logger.error(f"Unsupported config format: {suffix}. Only .toml is supported.")
+                raise ValueError(f"Only TOML format (.toml) is supported. Got: {suffix}")
             
-            connections_list = config.get('connections', [])
-            for conn_config in connections_list:
-                conn = ConnectionConfig(conn_config)
-                if conn.is_valid():
-                    self.connections.append(conn)
-                    logger.info(f"Loaded connection: {conn.node_id} ({conn.description or 'no description'})")
-                else:
-                    logger.warning(f"Skipping invalid connection config: {conn_config}")
+            with open(self.config_file, 'rb') as f:
+                config = tomli.load(f)
+            
+            # 读取全局配置（可选）
+            if 'global' in config:
+                global_cfg = config['global']
+                self.global_auth_token = global_cfg.get('auth_token', '')
+                self.global_server_ws = global_cfg.get('server_ws', 'ws://127.0.0.1:11435/ws')
+                logger.info(f"Loaded global config: server_ws={self.global_server_ws}")
+            
+            # 读取所有连接配置
+            # 支持两种格式：
+            # 1. [[connections]] 数组格式
+            # 2. [connections.xxx] 字典格式
+            if 'connections' in config:
+                conn_cfgs = config['connections']
+                
+                # 如果是数组格式 [[connections]]
+                if isinstance(conn_cfgs, list):
+                    for conn_data in conn_cfgs:
+                        node_id = conn_data.get('node_id', '')
+                        if not node_id:
+                            logger.warning("Skipping connection entry: missing node_id")
+                            continue
+                        
+                        conn_config = {
+                            'node_id': node_id,
+                            'auth_token': conn_data.get('auth_token', self.global_auth_token),
+                            'server_ws': conn_data.get('server_ws', self.global_server_ws),
+                            'local_server': conn_data.get('local_server', 'http://127.0.0.1:11434'),
+                            'heartbeat_interval': conn_data.get('heartbeat_interval', 15),
+                            'reconnect_delay': conn_data.get('reconnect_delay', 5),
+                            'enabled': conn_data.get('enabled', True),
+                            'description': conn_data.get('description', f'Connection: {node_id}')
+                        }
+                        
+                        conn = ConnectionConfig(conn_config)
+                        if conn.is_valid():
+                            self.connections.append(conn)
+                            logger.info(f"Loaded connection: {conn.node_id} ({conn.description})")
+                
+                # 如果是字典格式 [connections.xxx]
+                elif isinstance(conn_cfgs, dict):
+                    for name, conn_data in conn_cfgs.items():
+                        node_id = conn_data.get('node_id', '')
+                        if not node_id:
+                            logger.warning(f"Skipping connection {name}: missing node_id")
+                            continue
+                        
+                        conn_config = {
+                            'node_id': node_id,
+                            'auth_token': conn_data.get('auth_token', self.global_auth_token),
+                            'server_ws': conn_data.get('server_ws', self.global_server_ws),
+                            'local_server': conn_data.get('local_server', 'http://127.0.0.1:11434'),
+                            'heartbeat_interval': conn_data.get('heartbeat_interval', 15),
+                            'reconnect_delay': conn_data.get('reconnect_delay', 5),
+                            'enabled': conn_data.get('enabled', True),
+                            'description': conn_data.get('description', f'Connection: {name}')
+                        }
+                        
+                        conn = ConnectionConfig(conn_config)
+                        if conn.is_valid():
+                            self.connections.append(conn)
+                            logger.info(f"Loaded connection: {conn.node_id} ({conn.description})")
             
             logger.info(f"Total {len(self.connections)} valid connections loaded")
         except Exception as e:
             logger.error(f"Failed to load config: {e}")
+            raise
     
     async def start_all(self):
         """启动所有连接"""

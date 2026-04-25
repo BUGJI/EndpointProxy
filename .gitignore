@@ -1,11 +1,13 @@
-```
+```gitignore
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Environment variables
+# Dependencies
+venv/
+.venv/
 .env
 .env.local
 *.env.*
@@ -16,5 +18,21 @@ __pycache__/
 # Temporary files
 *.tmp
 *.swp
-*~
+*.swo
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# MyPy
+.mypy_cache/
+
+# PyTest
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
 ```

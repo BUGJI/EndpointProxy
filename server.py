@@ -12,6 +12,8 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web, ClientSession
 import uuid
+import tomli
+import tomli_w
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,40 +22,136 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class AuthManager:
-    """简单的JSON认证管理器"""
+    """TOML 格式的认证管理器（参考 frp 配置结构）"""
     
-    def __init__(self, config_file: str = "auth_config.json"):
+    def __init__(self, config_file: str = "auth_config.toml"):
         self.config_file = config_file
         self.clients: Dict[str, dict] = {}
+        self.global_auth_token = ''
+        # Web 面板管理员账号密码
+        self.admin_username = ''
+        self.admin_password = ''
         self.load_config()
     
     def load_config(self):
-        """加载认证配置"""
-        if Path(self.config_file).exists():
-            with open(self.config_file, 'r') as f:
-                config = json.load(f)
-                self.clients = config.get('clients', {})
-            logger.info(f"Loaded {len(self.clients)} clients from {self.config_file}")
-        else:
+        """加载 TOML 格式配置"""
+        config_path = Path(self.config_file)
+        if not config_path.exists():
             # 创建默认配置
             default_config = {
-                "clients": {
-                    "home-ollama": {
-                        "secret": "your-secret-key-change-this",
-                        "permissions": ["*"],
-                        "description": "Home Ollama instance"
+                'global': {
+                    'auth_token': 'your-global-auth-token',
+                    'admin_username': 'admin',
+                    'admin_password': 'admin123'
+                },
+                'clients': {
+                    'home-ollama': {
+                        'secret': 'your-secret-key-change-this',
+                        'permissions': ['*'],
+                        'description': 'Home Ollama instance'
                     }
                 }
             }
             self.save_config(default_config)
             self.clients = default_config['clients']
+            self.global_auth_token = default_config['global']['auth_token']
+            self.admin_username = default_config['global']['admin_username']
+            self.admin_password = default_config['global']['admin_password']
             logger.warning(f"Created default config file: {self.config_file}")
-            logger.warning(f"PLEASE CHANGE THE SECRET KEY!")
+            logger.warning(f"PLEASE CHANGE THE DEFAULT ADMIN PASSWORD AND SECRET KEY!")
+            return
+        
+        # 检测文件格式，只支持 TOML
+        suffix = config_path.suffix.lower()
+        
+        if suffix == '.toml':
+            self._load_toml_config(config_path)
+        else:
+            logger.error(f"Unsupported config format: {suffix}. Only .toml is supported.")
+            raise ValueError(f"Only TOML format (.toml) is supported. Got: {suffix}")
+    
+    def _load_toml_config(self, config_path: Path):
+        """加载 TOML 格式配置（参考 frp 结构）"""
+        try:
+            with open(config_path, 'rb') as f:
+                config = tomli.load(f)
+            
+            # 读取全局配置
+            if 'global' in config:
+                global_cfg = config['global']
+                self.global_auth_token = global_cfg.get('auth_token', '')
+                self.admin_username = global_cfg.get('admin_username', '')
+                self.admin_password = global_cfg.get('admin_password', '')
+                logger.info(f"Loaded global config: admin_username={self.admin_username}")
+            
+            # 读取客户端配置
+            # 支持两种格式：
+            # 1. [[clients]] 数组格式
+            # 2. [clients.xxx] 字典格式
+            if 'clients' in config:
+                clients_cfg = config['clients']
+                
+                # 如果是数组格式 [[clients]]
+                if isinstance(clients_cfg, list):
+                    for client in clients_cfg:
+                        node_id = client.get('node_id', '')
+                        if not node_id:
+                            logger.warning("Skipping client entry: missing node_id")
+                            continue
+                        self.clients[node_id] = {
+                            'secret': client.get('secret', self.global_auth_token),
+                            'permissions': client.get('permissions', ['*']),
+                            'description': client.get('description', f'Client: {node_id}')
+                        }
+                        logger.info(f"Loaded client: {node_id}")
+                
+                # 如果是字典格式 [clients.xxx]
+                elif isinstance(clients_cfg, dict):
+                    for node_id, client_data in clients_cfg.items():
+                        self.clients[node_id] = {
+                            'secret': client_data.get('secret', self.global_auth_token),
+                            'permissions': client_data.get('permissions', ['*']),
+                            'description': client_data.get('description', f'Client: {node_id}')
+                        }
+                        logger.info(f"Loaded client: {node_id} ({client_data.get('description', '')})")
+            
+            logger.info(f"Loaded {len(self.clients)} clients from TOML config")
+        except Exception as e:
+            logger.error(f"Failed to load TOML config: {e}")
+            raise
     
     def save_config(self, config: dict):
-        """保存配置"""
-        with open(self.config_file, 'w') as f:
-            json.dump(config, f, indent=2)
+        """保存为 TOML 格式配置"""
+        config_path = Path(self.config_file)
+        
+        # 确保是 TOML 格式
+        if config_path.suffix.lower() != '.toml':
+            config_path = config_path.with_suffix('.toml')
+        
+        output_config = {}
+        
+        # 全局配置
+        if self.admin_username or self.global_auth_token:
+            output_config['global'] = {
+                'auth_token': self.global_auth_token,
+                'admin_username': self.admin_username,
+                'admin_password': self.admin_password
+            }
+        
+        # 客户端配置（使用字典格式）
+        if 'clients' in config:
+            output_config['clients'] = {}
+            for node_id, data in config['clients'].items():
+                output_config['clients'][node_id] = {
+                    'secret': data.get('secret', ''),
+                    'permissions': data.get('permissions', ['*']),
+                    'description': data.get('description', '')
+                }
+        
+        with open(config_path, 'wb') as f:
+            tomli_w.dump(output_config, f)
+        
+        logger.info(f"Saved config to {config_path}")
     
     def authenticate(self, node_id: str, auth_token: str) -> bool:
         """验证客户端"""
@@ -85,7 +183,7 @@ class ReverseProxyServer:
                  client_port: int = 11435,
                  api_host: str = "0.0.0.0", 
                  api_port: int = 11434,
-                 auth_config: str = "auth_config.json"):
+                 auth_config: str = "auth_config.toml"):
         
         self.client_host = client_host
         self.client_port = client_port
@@ -275,7 +373,7 @@ class ReverseProxyServer:
                 "timestamp": datetime.now().isoformat()
             })
         
-        if request.path == '/nodes':
+        if request.path == '/nodes' or request.path == '/node/list':
             nodes = []
             for node_id, data in self.clients.items():
                 nodes.append({
@@ -287,6 +385,16 @@ class ReverseProxyServer:
                 })
             return web.json_response({"nodes": nodes, "total": len(nodes)})
         
+        # Web 面板管理接口
+        if request.path == '/api/panel/login':
+            return await self.handle_panel_login(request)
+        if request.path == '/api/panel/nodes':
+            return await self.handle_panel_nodes(request)
+        if request.path == '/api/panel/keys':
+            return await self.handle_panel_keys(request)
+        if request.path.startswith('/api/panel/key/'):
+            return await self.handle_panel_key_operation(request)
+
         # 解析路径: /{node_id}/{path}
         path_parts = request.path.lstrip('/').split('/', 1)
         
@@ -305,6 +413,173 @@ class ReverseProxyServer:
         # 代理请求
         return await self.proxy_request(node_id, request, remaining_path)
     
+    async def check_admin_auth(self, request: web.Request) -> bool:
+        """检查管理员认证"""
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return False
+        
+        token = auth_header[7:]
+        import base64
+        try:
+            decoded = base64.b64decode(token).decode('utf-8')
+            username, password = decoded.split(':', 1)
+            return username == self.auth.admin_username and password == self.auth.admin_password
+        except:
+            return False
+    
+    async def handle_panel_login(self, request: web.Request):
+        """处理面板登录"""
+        if request.method != 'POST':
+            return web.json_response({"error": "Method not allowed"}, status=405)
+        
+        try:
+            data = await request.json()
+            username = data.get('username', '')
+            password = data.get('password', '')
+            
+            if not self.auth.admin_username or not self.auth.admin_password:
+                return web.json_response({"error": "Admin credentials not configured"}, status=503)
+            
+            if username == self.auth.admin_username and password == self.auth.admin_password:
+                import base64
+                token = base64.b64encode(f"{username}:{password}".encode()).decode()
+                return web.json_response({
+                    "success": True,
+                    "token": token,
+                    "username": username
+                })
+            else:
+                return web.json_response({"error": "Invalid credentials"}, status=401)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+    
+    async def handle_panel_nodes(self, request: web.Request):
+        """处理面板节点列表请求"""
+        if not await self.check_admin_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        
+        if request.method != 'GET':
+            return web.json_response({"error": "Method not allowed"}, status=405)
+        
+        nodes = []
+        for node_id, data in self.clients.items():
+            nodes.append({
+                "node_id": node_id,
+                "info": data.get("info", {}),
+                "connected_at": data.get("connected_at").isoformat() if data.get("connected_at") else None,
+                "last_seen": data.get("last_seen").isoformat() if data.get("last_seen") else None,
+                "description": self.auth.clients.get(node_id, {}).get('description', ''),
+                "permissions": self.auth.clients.get(node_id, {}).get('permissions', [])
+            })
+        return web.json_response({"nodes": nodes, "total": len(nodes)})
+    
+    async def handle_panel_keys(self, request: web.Request):
+        """处理面板密钥管理请求（列出所有密钥）"""
+        if not await self.check_admin_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        
+        if request.method != 'GET':
+            return web.json_response({"error": "Method not allowed"}, status=405)
+        
+        keys = []
+        for node_id, data in self.auth.clients.items():
+            keys.append({
+                "node_id": node_id,
+                "secret": data.get('secret', ''),
+                "permissions": data.get('permissions', []),
+                "description": data.get('description', '')
+            })
+        return web.json_response({"keys": keys, "total": len(keys)})
+    
+    async def handle_panel_key_operation(self, request: web.Request):
+        """处理面板密钥增删改操作"""
+        if not await self.check_admin_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        
+        path_parts = request.path.rstrip('/').split('/')
+        if len(path_parts) < 5:
+            return web.json_response({"error": "Invalid path"}, status=400)
+        
+        node_id = path_parts[-1]
+        
+        if request.method == 'PUT':
+            try:
+                data = await request.json()
+                secret = data.get('secret', '')
+                permissions = data.get('permissions', ['*'])
+                description = data.get('description', f'Client: {node_id}')
+                
+                if not secret:
+                    import secrets
+                    secret = secrets.token_urlsafe(32)
+                
+                self.auth.clients[node_id] = {
+                    'secret': secret,
+                    'permissions': permissions if isinstance(permissions, list) else [permissions],
+                    'description': description
+                }
+                
+                self.auth.save_config({'clients': self.auth.clients})
+                logger.info(f"Updated/Added key for node: {node_id}")
+                return web.json_response({
+                    "success": True,
+                    "node_id": node_id,
+                    "secret": secret,
+                    "message": "Key updated successfully"
+                })
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=400)
+        
+        elif request.method == 'DELETE':
+            if node_id not in self.auth.clients:
+                return web.json_response({"error": "Node not found"}, status=404)
+            
+            del self.auth.clients[node_id]
+            
+            if node_id in self.clients:
+                ws = self.clients[node_id].get("websocket")
+                if ws and not ws.closed:
+                    await ws.close()
+                del self.clients[node_id]
+            
+            self.auth.save_config({'clients': self.auth.clients})
+            logger.info(f"Deleted key for node: {node_id}")
+            return web.json_response({
+                "success": True,
+                "node_id": node_id,
+                "message": "Key deleted successfully"
+            })
+        
+        elif request.method == 'POST':
+            try:
+                data = await request.json()
+                if node_id not in self.auth.clients:
+                    return web.json_response({"error": "Node not found"}, status=404)
+                
+                current = self.auth.clients[node_id]
+                if 'secret' in data:
+                    current['secret'] = data['secret']
+                if 'permissions' in data:
+                    perms = data['permissions']
+                    current['permissions'] = perms if isinstance(perms, list) else [perms]
+                if 'description' in data:
+                    current['description'] = data['description']
+                
+                self.auth.clients[node_id] = current
+                self.auth.save_config({'clients': self.auth.clients})
+                logger.info(f"Modified key for node: {node_id}")
+                return web.json_response({
+                    "success": True,
+                    "node_id": node_id,
+                    "message": "Key modified successfully"
+                })
+            except Exception as e:
+                return web.json_response({"error": str(e)}, status=400)
+        
+        else:
+            return web.json_response({"error": "Method not allowed"}, status=405)
+
     async def start_api_service(self):
         """启动API服务"""
         app = web.Application()
@@ -389,7 +664,7 @@ async def main():
     parser.add_argument("--client-port", type=int, default=11435, help="Client WebSocket service port")
     parser.add_argument("--api-host", default="0.0.0.0", help="API service host")
     parser.add_argument("--api-port", type=int, default=11434, help="API service port")
-    parser.add_argument("--auth-config", default="auth_config.json", help="Auth config file")
+    parser.add_argument("--auth-config", default="auth_config.toml", help="Auth config file (TOML format)")
     
     args = parser.parse_args()
     
