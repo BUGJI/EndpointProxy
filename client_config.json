@@ -1,0 +1,32 @@
+{
+    "connections": [
+        {
+            "node_id": "home-ollama",
+            "auth_token": "your-secret-key-change-this",
+            "server_ws": "ws://your-server-ip:11435/ws",
+            "local_server": "http://127.0.0.1:11434",
+            "heartbeat_interval": 15,
+            "reconnect_delay": 5,
+            "enabled": true,
+            "description": "Home Ollama instance"
+        },
+        {
+            "node_id": "office-api",
+            "auth_token": "another-secret-key",
+            "server_ws": "ws://your-server-ip:11435/ws",
+            "local_server": "http://127.0.0.1:8080",
+            "heartbeat_interval": 20,
+            "reconnect_delay": 10,
+            "enabled": true,
+            "description": "Office API server"
+        },
+        {
+            "node_id": "dev-service",
+            "auth_token": "dev-secret-key",
+            "server_ws": "ws://your-server-ip:11435/ws",
+            "local_server": "http://localhost:3000",
+            "enabled": false,
+            "description": "Development service (disabled)"
+        }
+    ]
+}

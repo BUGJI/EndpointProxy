@@ -4,13 +4,15 @@ import logging
 import signal
 import hashlib
 import hmac
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import aiohttp
 from aiohttp import ClientSession
 import argparse
 import time
 from datetime import datetime
-import backoff  # 需要安装: pip install backoff
+import backoff  # 需要安装：pip install backoff
+from pathlib import Path
+import configparser
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,6 +46,143 @@ class ReverseProxyClient:
             'reconnects': 0,
             'last_connected': None
         }
+    
+    def get_config(self) -> dict:
+        """返回当前连接的配置信息"""
+        return {
+            'node_id': self.node_id,
+            'server_ws_url': self.server_ws_url,
+            'local_server_url': self.local_server_url,
+            'heartbeat_interval': self.heartbeat_interval,
+            'reconnect_delay': self.reconnect_delay
+        }
+
+
+class ConnectionConfig:
+    """单个连接配置"""
+    def __init__(self, config: dict):
+        self.node_id = config.get('node_id', '')
+        self.auth_token = config.get('auth_token', '')
+        self.server_ws_url = config.get('server_ws', 'ws://127.0.0.1:11435/ws')
+        self.local_server_url = config.get('local_server', 'http://127.0.0.1:11434')
+        self.heartbeat_interval = config.get('heartbeat_interval', 15)
+        self.reconnect_delay = config.get('reconnect_delay', 5)
+        self.enabled = config.get('enabled', True)
+        self.description = config.get('description', '')
+    
+    def is_valid(self) -> bool:
+        """检查配置是否有效"""
+        return bool(self.node_id and self.enabled)
+    
+    def create_client(self) -> ReverseProxyClient:
+        """根据配置创建客户端实例"""
+        return ReverseProxyClient(
+            node_id=self.node_id,
+            auth_token=self.auth_token,
+            server_ws_url=self.server_ws_url,
+            local_server_url=self.local_server_url,
+            heartbeat_interval=self.heartbeat_interval,
+            reconnect_delay=self.reconnect_delay
+        )
+
+
+class MultiConnectionManager:
+    """多连接管理器 - 支持 INI 格式配置文件"""
+    def __init__(self, config_file: str):
+        self.config_file = Path(config_file)
+        self.connections: List[ConnectionConfig] = []
+        self.global_auth_token = ''
+        self.global_server_ws = ''
+        self.load_config()
+    
+    def load_config(self):
+        """加载 INI 配置文件"""
+        if not self.config_file.exists():
+            logger.error(f"Config file not found: {self.config_file}")
+            return
+        
+        try:
+            config = configparser.ConfigParser()
+            config.read(self.config_file, encoding='utf-8')
+            
+            # 读取全局配置（可选）
+            if 'global' in config:
+                self.global_auth_token = config.get('global', 'auth_token', fallback='')
+                self.global_server_ws = config.get('global', 'server_ws', fallback='ws://127.0.0.1:11435/ws')
+                logger.info(f"Loaded global config: server_ws={self.global_server_ws}")
+            
+            # 读取所有连接配置
+            for section in config.sections():
+                if section == 'global':
+                    continue
+                
+                # 跳过非 connection 节（可选：只处理以 connection_ 开头的节）
+                if not section.startswith('connection'):
+                    logger.warning(f"Skipping non-connection section: {section}")
+                    continue
+                
+                # 获取节点 ID（必须）
+                node_id = config.get(section, 'node_id', fallback='')
+                if not node_id:
+                    logger.warning(f"Skipping section {section}: missing node_id")
+                    continue
+                
+                # 构建配置字典
+                conn_config = {
+                    'node_id': node_id,
+                    'auth_token': config.get(section, 'auth_token', fallback=self.global_auth_token),
+                    'server_ws': config.get(section, 'server_ws', fallback=self.global_server_ws),
+                    'local_server': config.get(section, 'local_server', fallback='http://127.0.0.1:11434'),
+                    'heartbeat_interval': config.getint(section, 'heartbeat_interval', fallback=15),
+                    'reconnect_delay': config.getint(section, 'reconnect_delay', fallback=5),
+                    'enabled': config.getboolean(section, 'enabled', fallback=True),
+                    'description': config.get(section, 'description', fallback=f'Connection: {section}')
+                }
+                
+                conn = ConnectionConfig(conn_config)
+                if conn.is_valid():
+                    self.connections.append(conn)
+                    logger.info(f"Loaded connection: {conn.node_id} ({conn.description})")
+                else:
+                    logger.warning(f"Skipping invalid connection config: {conn_config}")
+            
+            logger.info(f"Total {len(self.connections)} valid connections loaded")
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+    
+    async def start_all(self):
+        """启动所有连接"""
+        if not self.connections:
+            logger.error("No valid connections to start")
+            return
+        
+        # 为每个连接创建客户端并启动
+        tasks = []
+        for conn in self.connections:
+            client = conn.create_client()
+            self.clients.append(client)
+            tasks.append(self._run_client(client))
+        
+        logger.info(f"Starting {len(tasks)} connections...")
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    async def _run_client(self, client: ReverseProxyClient):
+        """运行单个客户端"""
+        try:
+            await client.run()
+        except Exception as e:
+            logger.error(f"Client {client.node_id} error: {e}")
+    
+    async def stop_all(self):
+        """停止所有连接"""
+        logger.info("Stopping all connections...")
+        for client in self.clients:
+            client.running = False
+        
+        # 等待所有客户端停止
+        stop_tasks = [client.stop() for client in self.clients]
+        await asyncio.gather(*stop_tasks, return_exceptions=True)
+        logger.info("All connections stopped")
     
     async def create_session(self):
         """创建HTTP会话"""
@@ -317,8 +456,11 @@ class ReverseProxyClient:
 
 async def main():
     parser = argparse.ArgumentParser(description="Reverse Proxy Client")
-    parser.add_argument("--node-id", required=True, help="Unique node ID")
-    parser.add_argument("--auth-token", required=True, help="Authentication token")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--config", help="Configuration file for multiple connections")
+    group.add_argument("--node-id", help="Unique node ID (single connection mode)")
+    
+    parser.add_argument("--auth-token", help="Authentication token (single connection mode)")
     parser.add_argument("--server-ws", default="ws://127.0.0.1:11435/ws", 
                        help="Server WebSocket URL")
     parser.add_argument("--local-server", default="http://127.0.0.1:11434", 
@@ -330,24 +472,40 @@ async def main():
     
     args = parser.parse_args()
     
-    client = ReverseProxyClient(
-        node_id=args.node_id,
-        auth_token=args.auth_token,
-        server_ws_url=args.server_ws,
-        local_server_url=args.local_server,
-        heartbeat_interval=args.heartbeat,
-        reconnect_delay=args.reconnect_delay
-    )
-    
     # 优雅关闭
+    manager = None
+    client = None
+    
     def shutdown(signum, frame):
         logger.info("Shutting down...")
-        asyncio.create_task(client.stop())
+        if manager:
+            asyncio.create_task(manager.stop_all())
+        elif client:
+            asyncio.create_task(client.stop())
     
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     
-    await client.run()
+    # 多连接模式
+    if args.config:
+        logger.info(f"Loading configuration from {args.config}")
+        manager = MultiConnectionManager(args.config)
+        await manager.start_all()
+    else:
+        # 单连接模式（原有行为）
+        if not args.node_id or not args.auth_token:
+            parser.error("--node-id and --auth-token are required in single connection mode")
+        
+        client = ReverseProxyClient(
+            node_id=args.node_id,
+            auth_token=args.auth_token,
+            server_ws_url=args.server_ws,
+            local_server_url=args.local_server,
+            heartbeat_interval=args.heartbeat,
+            reconnect_delay=args.reconnect_delay
+        )
+        
+        await client.run()
 
 if __name__ == "__main__":
     asyncio.run(main())
